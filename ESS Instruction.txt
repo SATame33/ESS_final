@@ -1,0 +1,182 @@
+ESS 스케줄링 전략에 대한 논문을 쓰려고 하는데 전략은 아래와 같아.
+
+문제: 1년(8760시간) 동안의 전력계통에서 부하·재생발전 변동과 설비 고장이 섞여 발생할 때, 에너지 저장장치(ESS)를 어떻게 운전하면 LOLE(부족 발생 시간 수) 최소화 및 차익거래 수익 최대화를 동시에 달성할 수 있는가?
+
+위험도 산정 구조(SSOT 기반, 0~1 위험도 시계열)
+
+이 시뮬레이션은 SSOT(Single Source of Truth) 원칙으로, “발전기/송전선 고장 상태 → 시간별 공급가능용량”을 한 번 계산한 용량 시계열을 위험도 계산과 시뮬레이션에서 동일하게 공유한다.
+
+시간 t에서 발전기 온라인 여부로부터 **발전가능용량 GenCap(t)**를 만들고, 송전선 온라인 여부로부터 **송전가능용량 LineCap(t)**를 만든다.
+
+계통의 “확정 공급가능용량”은 **FirmCap(t) = min(GenCap(t), LineCap(t))**로 정의한다.
+
+실제 전력수지는 FirmSupply(t) = FirmCap(t) + RenewableActual(t) 로 구성한다. (재생은 실제값)
+
+위험도는 아래 요소를 정규화/클리핑 후 가중합해 만들고, 최종적으로 0~1로 스케일된 R(t) 시계열을 만든다.
+
+순부하 압박(α)
+
+부하에서 재생 예측값을 뺀 **예측 순부하 NetLoad_fc(t) = max(0, Load(t) − RenewableForecast(t))**를 쓰고
+
+α_raw(t) = NetLoad_fc(t) / FirmCap(t) 로 “공급 압박”을 계산한다.
+
+최악 N-1 기대 위험(β)
+
+시간 t에서 가능한 모든 N-1(발전기 1기 상실, 또는 송전선 1개 상실)을 가정하고, 그 중 가장 위험한 1개를 선택한다.
+
+각 후보에 대해 (i) 상실 후 남는 용량 **FirmAfter(t)**를 계산하고, (ii) 그때의 **공급여유(margin)**로부터 심각도(severity)를 만들고, (iii) 고장률(FOR)과 MTTR로부터 구한 시간당 고장확률을 이용해 향후 6시간 내 고장 발생확률 p_fail을 만든다.
+
+그리고 β_raw(t) = severity × p_fail 로 정의한다. (즉, “심각도”와 “발생성”을 곱한 기대 위험)
+
+재생 예측 불확실성(σ)
+
+재생 예측 표준편차를 시계열로 두고, σ_raw(t) = (RenewableForecastStd(t))² 형태로 분산(variance-like) 성분을 만든다.
+
+전방 누적 에너지 위험(accum)
+
+base deficit + 기대 N-1 deficit을 이용해 **기대 부족전력 d_exp(t)**를 정의한다.
+
+d_base(t) = max(0, NetLoad_fc(t) − FirmCap(t))
+
+d_n1(t) = p_fail_best(t) × max(0, NetLoad_fc(t) − FirmAfterBest(t))
+
+d_exp(t) = d_base(t) + d_n1(t)
+
+그리고 6시간 창에서 **전방 누적 부족에너지(Forward accumulated deficit energy)**를 계산해, ESS 에너지용량 대비 비율로 정규화한다.
+
+accum은 “지금부터 몇 시간 동안 부족에너지가 누적되면, ESS 용량 관점에서 얼마나 위험한가”를 반영한다.
+
+최종 위험도는
+R(t) = w₁·α(t) + w₂·β(t) + w₃·σ(t) + w₄·accum(t)
+로 구성하며, 각 항은 퍼센타일 클리핑 후 0~1로 min-max 정규화되어 결합된다.
+
+제어 정책(데드라인 정렬형, 2-임계치 + 2-SOC floor)
+
+제어는 위험도 시계열 하나만 바라보고 결정하는 deadline-aligned control 구조다.
+
+위험도에는 두 개의 임계치가 있다: τ₁ < τ₂
+
+저장장치에는 두 개의 SOC 하한(에너지 바닥)이 있다: s₁ < s₂ (단위는 %)
+
+현재 시각 t에서 6시간 look-ahead로 위험도 예측 시계열을 만들고(코드에서는 oracle 기반 + noise), 그 안에서
+
+τ₂를 최초로 넘는 시각이 있으면, 그 시각 이후로 SOC ≥ s₂(에너지 기준) 하한을 강제한다.
+
+τ₂ 이벤트가 없고, τ₁을 최초로 넘는 시각이 있으면, 그 시각 이후로 SOC ≥ s₁ 하한을 강제한다.
+
+둘 다 없으면 저위험 구간이므로, MPC를 생략하고 TOU 규칙 기반으로만 동작한다. (속도 최적화)
+
+즉,
+
+저위험(R(t) < τ₁): TOU 기반 차익거래로 수익을 최대로 회수한다.
+
+중간위험(τ₁ 이벤트 예정): s₁ 바닥을 맞추면서, 남는 범위(100−s₁)에 대해서는 TOU 성격의 arbitrage를 수행한다.
+
+고위험(τ₂ 이벤트 예정): 위험도가 높으므로 s₂ 바닥을 강하게 유지하는 방향으로 움직이며, 신뢰도 유지를 우선한다.
+
+추가로, **사고로 인해 공급이 부족한 경우(Load > FirmSupply)**에는 어떤 전략이든 상관없이 무조건 emergency discharge를 먼저 수행해서 “예비력”처럼 동작한다.
+
+ESS 모델링의 핵심 원칙
+
+방전은 계통에 주입되어 부족을 해소하는 자원으로 반영된다. (unserved를 줄이는 방향)
+
+충전은 계통 전력수지에 넣지 않고, 계통 외부 전원으로 충전한다고 가정한다. 그래서 “부족 여부(deficit)” 계산에는 충전이 들어가지 않는다.
+
+ESS 물리 제약은 다음을 포함한다:
+
+충·방전 효율(η_charge, η_discharge)
+
+에너지 용량(E_max), 출력 용량(P_max)
+
+동시 충·방전은 pc + pd ≤ P_max로 완화된 방식으로 금지한다. (MILP binary 없이 convex 형태)
+
+열화비용(degradation cost)은 throughput(MWh)에 비례해 비용으로 반영한다.
+
+최적화 구조(Phase 1~3)
+
+이 코드는 “Sizing → Offline 파라미터 튜닝 → Full-year MC 평가”의 3단으로 구성된다.
+
+Phase 1: Data-driven ESS sizing (NoESS 기반)
+
+ESS 없이(=NoESS) 여러 시나리오를 생성해, 연간(8760h) 부족 이벤트(deficit event) 통계를 모은다.
+
+deficit 이벤트는 연속된 deficit 구간을 하나의 이벤트로 보고,
+
+이벤트의 피크 부족전력(=필요 P),
+
+이벤트의 필요 방전에너지(=필요 E, η_dis 고려)
+를 계산한다.
+
+목표 quantile(코드에서는 q_target=0.99)을 만족하도록, P_max와 E_max를 joint coverage 기준으로 추천하고 그 값을 ESS 용량으로 채택한다.
+
+Phase 2: Offline Optimization (Bayesian)
+
+위험기반 전략의 파라미터 **(τ₁, τ₂, s₁, s₂)**는 베이지안 최적화로 찾는다.
+
+최적화는 축약된 운전기간(코드에서는 720h) 시나리오를 여러 번(offline_mc_scenarios) 돌려 평균 성능을 평가한다.
+
+목적함수는 LOLE를 강하게 줄이되, 수익도 반영하는 가중 목적 형태다:
+
+minimize: (lole_weight × LOLE) − (profit_weight × Profit)
+
+Phase 3: Monte Carlo Evaluation (Full Year)
+
+8760h 시나리오를 여러 개(mc_eval_scenarios) 생성해, 아래 4개 케이스를 동일 조건에서 비교한다.
+
+비교군(Benchmark) 설정
+
+이 전략이 우수하다는 것을 증명하려면 비교 대상이 필요하므로, 케이스는 아래 4가지를 둔다.
+
+Case 1: ESS 없음 (NoESS)
+
+Case 2: 단순 TOU 운전 (위험도 고려 X)
+
+Case 3: Renewable 기반 (재생이 높으면 충전, 재생이 낮고 가격이 높으면 방전)
+
+Case 4: 제안 전략 (Risk-based, 위험도 + MPC + 데드라인 정렬형 SOC floor)
+
+평가 지표(코드 출력 기준)
+
+각 케이스에 대해 연간(8760h) 기준으로 아래 성능을 출력한다.
+
+신뢰도/에너지 부족
+
+LOLE (h)
+
+EENS (MWh)
+
+경제성
+
+Profit ($)
+(방전 수익 − 충전 비용 − 열화비용, emergency discharge의 방전도 동일하게 정산에 포함)
+
+위험도 임계치(τ₂) 기준 진단 지표 (RiskBased에서만)
+
+Time-based metrics: AUC, Precision, Recall, Resolved(=위험 신호를 낸 시점 중 unserved가 0으로 해결된 비율), 그리고 TP/FP/FN/TN
+
+Event-based metrics: Event Recall, Avg Lead Time (이벤트 시작 전 몇 시간 전에 알람이 처음 잡혔는지)
+
+또한 결과 재현/분석을 위해, 마지막 RiskBased 시나리오에 대해
+
+8760h 전체 엑셀(simulation_result_full.xlsx),
+
+첫 1주(168h) 엑셀(simulation_result_week1.xlsx)
+을 저장하고, 첫 주 구간에 대해 Deficit/Emergency, SOC, Risk 시계열을 플롯으로 확인한다.
+
+시나리오/고장/예측오차 가정(코드 구현 기준)
+
+부하는 24시간 주기의 일변동(sine 형태) + 가우시안 노이즈로 생성한다.
+
+재생은 태양광(주간 형태) + 풍력(AR(1) 유사 랜덤)을 합성하고, 실제값과 예측값을 분리한다.
+
+예측은 단순 평활화 후, 시간별 표준편차(기본값 + 출력 비례)를 두고 노이즈로 오차를 반영한다.
+
+가격은 시간대별 TOU로 구성한다. (off/mid/peak 값이 24시간 규칙으로 반복)
+
+발전기/송전선 고장은 2-state 마코프 체인(online/offline)으로 생성하며,
+
+FOR과 MTTR로부터 시간당 고장전이확률을 맞추고,
+
+MTTR로부터 복구확률을 정의한다.
+
+N-1 위험(β)은 “현재 온라인인 설비 중 1개 상실”을 모두 후보로 두고, 그 중 최악 후보를 사용한다.

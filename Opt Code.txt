@@ -1,0 +1,783 @@
+from __future__ import annotations
+
+import math
+import numpy as np
+from dataclasses import dataclass
+from enum import Enum, auto
+from typing import Tuple, Dict, List, Optional, Callable, NamedTuple
+
+from skopt import gp_minimize
+from skopt.space import Real
+import cvxpy as cp
+
+
+# ============================================================
+# 1. Config dataclasses (Single Source Of Truth)
+# ============================================================
+
+@dataclass(frozen=True)
+class TimeConfig:
+    num_hours: int = 8760
+    dt_hours: float = 1.0
+    look_ahead_hours: int = 6
+
+
+@dataclass(frozen=True)
+class ESSConfig:
+    # 300MW / 600MWh (대규모 사고 방어용)
+    energy_capacity_mwh: float = 600.0
+    power_charge_mw: float = 300.0
+    power_discharge_mw: float = 300.0
+    efficiency_charge: float = 0.95
+    efficiency_discharge: float = 0.95
+    soc_min_tech: float = 0.05
+    soc_max: float = 0.95
+    soc_initial: float = 0.5
+    degradation_cost_per_mwh: float = 1.0
+
+
+@dataclass(frozen=True)
+class RiskWeightConfig:
+    w_alpha: float = 0.4
+    w_beta: float = 0.4
+    w_sigma: float = 0.2
+
+    def as_tuple(self) -> Tuple[float, float, float]:
+        return self.w_alpha, self.w_beta, self.w_sigma
+
+
+@dataclass(frozen=True)
+class ReliabilityConfig:
+    # 대규모 전력 계통 설정 (가혹 조건)
+    firm_capacity_mw: float = 3800.0
+    largest_unit_mw: float = 1000.0
+    value_of_lost_load_per_mwh: float = 10000.0
+
+
+@dataclass(frozen=True)
+class OptimizationWeightConfig:
+    # 목적함수 밸런싱: Profit(수십만)과 LOLE(수십) 스케일 맞춤
+    lole_weight: float = 1.0
+    eens_weight: float = 0.0
+    profit_weight: float = 0.000005
+
+
+@dataclass(frozen=True)
+class RiskBasedPolicyParams:
+    tau1: float
+    tau2: float
+    s1: float
+    s2: float
+
+
+@dataclass(frozen=True)
+class MarketRuleConfig:
+    price_low_quantile: float = 0.3
+    price_high_quantile: float = 0.7
+    renewable_low_quantile: float = 0.3
+    renewable_high_quantile: float = 0.7
+
+
+@dataclass(frozen=True)
+class SimulationConfig:
+    time: TimeConfig = TimeConfig()
+    ess: ESSConfig = ESSConfig()
+    risk_weights: RiskWeightConfig = RiskWeightConfig()
+    reliability: ReliabilityConfig = ReliabilityConfig()
+    optimization_weights: OptimizationWeightConfig = OptimizationWeightConfig()
+    market_rules: MarketRuleConfig = MarketRuleConfig()
+    # 탐색 범위
+    tau1_bounds: Tuple[float, float] = (0.1, 0.7)
+    tau2_bounds: Tuple[float, float] = (0.3, 0.99)
+    s1_bounds: Tuple[float, float] = (0.1, 0.6)
+    s2_bounds: Tuple[float, float] = (0.4, 0.9)
+    # 최적화 설정
+    offline_mc_scenarios: int = 5
+    offline_n_calls: int = 30
+    random_seed: int = 42
+
+
+# ============================================================
+# 2. Data Structures for Simulation
+# ============================================================
+
+class Strategy(Enum):
+    NO_ESS = auto()
+    TOU = auto()
+    RENEWABLE = auto()
+    RISK_BASED = auto()
+
+
+class SystemScenario(NamedTuple):
+    load_mw: np.ndarray
+    renewable_mw: np.ndarray
+    firm_capacity_mw: np.ndarray
+    mssc_mw: np.ndarray
+    forecast_error_std: np.ndarray
+    price_mwh: np.ndarray
+
+
+@dataclass
+class ThresholdMetrics:
+    tau: float
+    recall: float
+    precision: float
+    false_positive_rate: float
+    miss_rate: float
+    emergency_called_rate: float
+    auc: float
+    emergency_resolve_rate: float
+
+
+@dataclass
+class SimulationResult:
+    strategy: Strategy
+    soc: np.ndarray
+    ess_power_mw: np.ndarray
+    risk_series: np.ndarray
+    shortage_without_ess: np.ndarray
+    shortage_with_ess: np.ndarray
+    lole_hours_without_ess: float
+    lole_hours_with_ess: float
+    eens_mwh_without_ess: float
+    eens_mwh_with_ess: float
+    profit: float
+    degradation_cost: float
+    energy_charged_mwh: float
+    energy_discharged_mwh: float
+    tau1_metrics: Optional[ThresholdMetrics] = None
+    tau2_metrics: Optional[ThresholdMetrics] = None
+
+
+@dataclass
+class RiskComponents:
+    alpha: np.ndarray
+    beta: np.ndarray
+    sigma: np.ndarray
+    risk: np.ndarray
+
+
+@dataclass
+class ESSStepResult:
+    new_soc: float
+    actual_power_mw: float
+    degradation_cost: float
+    energy_charged_mwh: float
+    energy_discharged_mwh: float
+
+
+@dataclass
+class MarketThresholds:
+    price_low: float
+    price_high: float
+    renewable_low: float
+    renewable_high: float
+
+
+# ============================================================
+# 3. Utility Functions
+# ============================================================
+
+def safe_normalize(arr: np.ndarray, eps: float = 1e-9) -> np.ndarray:
+    arr = np.asarray(arr, dtype=float)
+    if arr.size == 0:
+        return arr
+    min_v = float(np.min(arr))
+    max_v = float(np.max(arr))
+    if math.isclose(max_v, min_v, rel_tol=1e-9, abs_tol=1e-9):
+        return np.zeros_like(arr, dtype=float)
+    return (arr - min_v) / (max_v - min_v + eps)
+
+
+def find_deadline(risk: np.ndarray, start_idx: int, tau: float, max_horizon: int) -> Optional[int]:
+    end_idx = min(len(risk), start_idx + max_horizon)
+    for k in range(start_idx, end_idx):
+        if risk[k] >= tau:
+            return k
+    return None
+
+
+def compute_auc_pairwise(y_true: np.ndarray, scores: np.ndarray) -> float:
+    y_true = np.asarray(y_true, dtype=int)
+    scores = np.asarray(scores, dtype=float)
+    pos_scores = scores[y_true == 1]
+    neg_scores = scores[y_true == 0]
+    n_pos = pos_scores.size
+    n_neg = neg_scores.size
+    if n_pos == 0 or n_neg == 0:
+        return 0.5
+    total = 0.0
+    for s_pos in pos_scores:
+        total += np.sum(s_pos > neg_scores)
+        total += 0.5 * np.sum(np.isclose(s_pos, neg_scores))
+    auc = total / float(n_pos * n_neg)
+    return float(auc)
+
+
+def compute_threshold_metrics(
+        risk: np.ndarray,
+        ground_truth_shortage: np.ndarray,
+        final_shortage: np.ndarray,
+        tau: float,
+) -> ThresholdMetrics:
+    risk = np.asarray(risk, dtype=float)
+    y_true = np.asarray(ground_truth_shortage, dtype=bool)
+    y_final = np.asarray(final_shortage, dtype=bool)
+    y_pred = risk >= tau
+
+    tp = float(np.sum(y_pred & y_true))
+    fp = float(np.sum(y_pred & ~y_true))
+    fn = float(np.sum(~y_pred & y_true))
+    tn = float(np.sum(~y_pred & ~y_true))
+
+    positive = tp + fn
+    negative = fp + tn
+    total = positive + negative if (positive + negative) > 0 else 1.0
+
+    recall = tp / positive if positive > 0 else 0.0
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    false_positive_rate = fp / negative if negative > 0 else 0.0
+    miss_rate = fn / positive if positive > 0 else 0.0
+    emergency_called_rate = (tp + fp) / total
+
+    resolved = np.logical_and(y_true, np.logical_not(y_final))
+    resolved_and_called = np.logical_and(resolved, y_pred)
+    resolved_count = float(np.sum(resolved_and_called))
+    emergency_resolve_rate = resolved_count / positive if positive > 0 else 0.0
+
+    auc = compute_auc_pairwise(y_true.astype(int), risk)
+
+    return ThresholdMetrics(
+        tau=float(tau),
+        recall=float(recall),
+        precision=float(precision),
+        false_positive_rate=float(false_positive_rate),
+        miss_rate=float(miss_rate),
+        emergency_called_rate=float(emergency_called_rate),
+        auc=float(auc),
+        emergency_resolve_rate=float(emergency_resolve_rate),
+    )
+
+
+# ============================================================
+# 4. Core Logic Functions
+# ============================================================
+
+def generate_synthetic_scenario(config: SimulationConfig, rng: np.random.Generator) -> SystemScenario:
+    t_cfg = config.time
+    r_cfg = config.reliability
+    hours = t_cfg.num_hours
+
+    # Load: 3000 ~ 3500 MW scale
+    hours_array = np.arange(hours)
+    daily_cycle = np.sin(2.0 * np.pi * (hours_array % 24) / 24.0 - np.pi / 2.0) * 0.5 + 0.5
+    base_load = 3000.0 + 500.0 * daily_cycle
+
+    weekly_mod = 1.0 + 0.05 * np.sin(2.0 * np.pi * hours_array / hours)
+    load_mw = base_load * weekly_mod
+    load_mw += rng.normal(0.0, 50.0, size=hours)
+    load_mw = np.clip(load_mw, 1000.0, None)
+
+    # Renewable: ~1500 MW scale
+    solar_cycle = np.sin(2.0 * np.pi * ((hours_array % 24) - 6.0) / 24.0)
+    solar_cycle = np.clip(solar_cycle, 0.0, None)
+    solar = 1500.0 * solar_cycle
+
+    wind_base = 500.0 + 150.0 * np.sin(2.0 * np.pi * hours_array / 48.0)
+    wind_noise = rng.normal(0.0, 50.0, size=hours)
+    wind = np.clip(wind_base + wind_noise, 0.0, None)
+
+    renewable_mw = solar + wind
+
+    # Firm capacity with outages
+    firm_capacity_mw = np.full(hours, r_cfg.firm_capacity_mw, dtype=float)
+    forced_outage_prob = 0.2
+    is_outage = rng.random(size=hours) < forced_outage_prob
+    firm_capacity_mw[is_outage] -= r_cfg.largest_unit_mw
+    firm_capacity_mw = np.maximum(firm_capacity_mw, 0.0)
+
+    # Derived components
+    net_load = load_mw - renewable_mw
+    mssc_mw = firm_capacity_mw - r_cfg.largest_unit_mw - net_load
+
+    base_std = 50.0 + 20.0 * safe_normalize(np.abs(net_load))
+    forecast_error_std = np.clip(base_std + rng.normal(0.0, 10.0, size=hours), 1.0, None)
+
+    price_base = 60.0 + 20.0 * safe_normalize(net_load)
+    price_renewable_discount = -10.0 * safe_normalize(renewable_mw)
+    scarcity_premium = 50.0 * safe_normalize(np.maximum(0.0, net_load - (r_cfg.firm_capacity_mw * 0.8)))
+    noise = rng.normal(0.0, 3.0, size=hours)
+    price_mwh = np.clip(price_base + price_renewable_discount + scarcity_premium + noise, 10.0, None)
+
+    return SystemScenario(
+        load_mw=load_mw,
+        renewable_mw=renewable_mw,
+        firm_capacity_mw=firm_capacity_mw,
+        mssc_mw=mssc_mw,
+        forecast_error_std=forecast_error_std,
+        price_mwh=price_mwh,
+    )
+
+
+def compute_risk_series(scenario: SystemScenario, config: SimulationConfig) -> RiskComponents:
+    r_cfg = config.reliability
+    w_alpha, w_beta, w_sigma = config.risk_weights.as_tuple()
+
+    load = np.asarray(scenario.load_mw, dtype=float)
+    renewable = np.asarray(scenario.renewable_mw, dtype=float)
+    firm = np.asarray(scenario.firm_capacity_mw, dtype=float)
+    mssc = np.asarray(scenario.mssc_mw, dtype=float)
+    sigma_std = np.asarray(scenario.forecast_error_std, dtype=float)
+
+    net_load = load - renewable
+    alpha_raw = net_load / np.maximum(firm, 1e-6)
+
+    max_ref = r_cfg.largest_unit_mw
+    mssc_clipped = np.clip(mssc, -max_ref, max_ref)
+    beta_raw = -mssc_clipped
+
+    sigma_raw = sigma_std ** 2
+
+    alpha_norm = safe_normalize(alpha_raw)
+    beta_norm = safe_normalize(beta_raw)
+    sigma_norm = safe_normalize(sigma_raw)
+
+    risk = w_alpha * alpha_norm + w_beta * beta_norm + w_sigma * sigma_norm
+    risk = np.clip(risk, 0.0, 1.0)
+
+    return RiskComponents(alpha=alpha_norm, beta=beta_norm, sigma=sigma_norm, risk=risk)
+
+
+def compute_market_thresholds(scenario: SystemScenario, config: SimulationConfig) -> MarketThresholds:
+    m_cfg = config.market_rules
+    price = np.asarray(scenario.price_mwh, dtype=float)
+    renewable = np.asarray(scenario.renewable_mw, dtype=float)
+
+    price_low = float(np.quantile(price, m_cfg.price_low_quantile))
+    price_high = float(np.quantile(price, m_cfg.price_high_quantile))
+    renewable_low = float(np.quantile(renewable, m_cfg.renewable_low_quantile))
+    renewable_high = float(np.quantile(renewable, m_cfg.renewable_high_quantile))
+
+    return MarketThresholds(
+        price_low=price_low,
+        price_high=price_high,
+        renewable_low=renewable_low,
+        renewable_high=renewable_high,
+    )
+
+
+def apply_ess_power(soc: float, requested_power_mw: float, config: SimulationConfig) -> ESSStepResult:
+    ess = config.ess
+    dt = config.time.dt_hours
+    soc = float(soc)
+    p_req = float(requested_power_mw)
+
+    if p_req > 0.0:
+        p = min(p_req, ess.power_discharge_mw)
+    elif p_req < 0.0:
+        p = max(p_req, -ess.power_charge_mw)
+    else:
+        p = 0.0
+
+    energy_charged_mwh = 0.0
+    energy_discharged_mwh = 0.0
+    degradation_cost = 0.0
+
+    if p > 0.0:
+        max_energy_from_soc = max(0.0, (soc - ess.soc_min_tech) * ess.energy_capacity_mwh)
+        max_p_by_soc = max_energy_from_soc * ess.efficiency_discharge / dt
+        p_limited = min(p, max_p_by_soc)
+        if p_limited < 1e-9:
+            p_limited = 0.0
+
+        energy_out_mwh = p_limited * dt
+        energy_from_storage = energy_out_mwh / ess.efficiency_discharge if ess.efficiency_discharge > 0 else 0.0
+        new_soc = soc - energy_from_storage / ess.energy_capacity_mwh
+
+        energy_discharged_mwh = energy_out_mwh
+        degradation_cost = abs(energy_out_mwh) * ess.degradation_cost_per_mwh
+        actual_power_mw = p_limited
+
+    elif p < 0.0:
+        p_abs = abs(p)
+        max_energy_to_soc = max(0.0, (ess.soc_max - soc) * ess.energy_capacity_mwh)
+        max_p_by_soc = max_energy_to_soc / (ess.efficiency_charge * dt) if ess.efficiency_charge > 0 else 0.0
+        p_abs_limited = min(p_abs, max_p_by_soc)
+        if p_abs_limited < 1e-9:
+            p_abs_limited = 0.0
+
+        energy_in_mwh = p_abs_limited * dt
+        stored_mwh = energy_in_mwh * ess.efficiency_charge
+        new_soc = soc + stored_mwh / ess.energy_capacity_mwh
+
+        energy_charged_mwh = energy_in_mwh
+        degradation_cost = abs(energy_in_mwh) * ess.degradation_cost_per_mwh
+        actual_power_mw = -p_abs_limited
+    else:
+        new_soc = soc
+        actual_power_mw = 0.0
+
+    new_soc = float(np.clip(new_soc, ess.soc_min_tech, ess.soc_max))
+
+    return ESSStepResult(
+        new_soc=new_soc,
+        actual_power_mw=actual_power_mw,
+        degradation_cost=degradation_cost,
+        energy_charged_mwh=energy_charged_mwh,
+        energy_discharged_mwh=energy_discharged_mwh
+    )
+
+
+# ============================================================
+# 5. Simulation Logic
+# ============================================================
+
+class SimulationRunner:
+    def __init__(self, config: SimulationConfig, scenario: SystemScenario):
+        self.config = config
+        self.scenario = scenario
+        self.risk_components = compute_risk_series(scenario, config)
+        self.market_thresholds = compute_market_thresholds(scenario, config)
+
+    def simulate(self, strategy: Strategy, risk_params: Optional[RiskBasedPolicyParams] = None) -> SimulationResult:
+        cfg = self.config
+        ess = cfg.ess
+        t_cfg = cfg.time
+        hours = t_cfg.num_hours
+        dt = t_cfg.dt_hours
+
+        load = np.asarray(self.scenario.load_mw, dtype=float)
+        renewable = np.asarray(self.scenario.renewable_mw, dtype=float)
+        firm = np.asarray(self.scenario.firm_capacity_mw, dtype=float)
+        price = np.asarray(self.scenario.price_mwh, dtype=float)
+        risk = np.asarray(self.risk_components.risk, dtype=float)
+
+        soc = np.zeros(hours + 1, dtype=float)
+        soc[0] = ess.soc_initial
+        ess_power = np.zeros(hours, dtype=float)
+        shortage_no_ess = np.zeros(hours, dtype=bool)
+        shortage_with_ess = np.zeros(hours, dtype=bool)
+
+        lole_no_ess = 0.0
+        lole_with_ess = 0.0
+        eens_no_ess = 0.0
+        eens_with_ess = 0.0
+        total_profit = 0.0
+        total_degradation_cost = 0.0
+        total_charged = 0.0
+        total_discharged = 0.0
+
+        thresholds = self.market_thresholds
+
+        for t in range(hours):
+            soc_t = float(soc[t])
+            load_t = float(load[t])
+            ren_t = float(renewable[t])
+            firm_t = float(firm[t])
+            price_t = float(price[t])
+            risk_t = float(risk[t])
+
+            supply_no_ess = ren_t + firm_t
+            base_shortage_mw = max(0.0, load_t - supply_no_ess)
+            shortage_no_ess[t] = base_shortage_mw > 1e-6
+            if base_shortage_mw > 1e-6:
+                lole_no_ess += dt
+                eens_no_ess += base_shortage_mw * dt
+
+            if strategy == Strategy.NO_ESS:
+                planned_power = 0.0
+            elif strategy == Strategy.TOU:
+                planned_power = self._decide_tou_power(soc_t, price_t, ess.soc_min_tech, thresholds)
+            elif strategy == Strategy.RENEWABLE:
+                planned_power = self._decide_renewable_power(soc_t, ren_t, ess.soc_min_tech, thresholds)
+            elif strategy == Strategy.RISK_BASED:
+                if risk_params is None:
+                    raise ValueError("Risk params required")
+                planned_power = self._decide_risk_based_power(t, soc_t, price_t, risk_t, risk, risk_params, thresholds)
+            else:
+                planned_power = 0.0
+
+            # Emergency override
+            if base_shortage_mw > 0.0:
+                max_discharge = self._max_discharge_power(soc_t)
+                emergency_power = min(max_discharge, base_shortage_mw)
+                planned_power = max(planned_power, emergency_power)
+
+            ess_step = apply_ess_power(soc_t, planned_power, cfg)
+            soc[t + 1] = ess_step.new_soc
+            actual_p = ess_step.actual_power_mw
+            ess_power[t] = actual_p
+
+            injection_mw = max(0.0, actual_p)
+            supply_with_ess = supply_no_ess + injection_mw
+            shortage_mw_with_ess = max(0.0, load_t - supply_with_ess)
+            shortage_with_ess[t] = shortage_mw_with_ess > 1e-6
+            if shortage_mw_with_ess > 1e-6:
+                lole_with_ess += dt
+                eens_with_ess += shortage_mw_with_ess * dt
+
+            rev = ess_step.energy_discharged_mwh * price_t
+            cost = ess_step.energy_charged_mwh * price_t
+            total_profit += rev - cost - ess_step.degradation_cost
+            total_degradation_cost += ess_step.degradation_cost
+            total_charged += ess_step.energy_charged_mwh
+            total_discharged += ess_step.energy_discharged_mwh
+
+        tau1_metrics = None
+        tau2_metrics = None
+        if strategy == Strategy.RISK_BASED and risk_params is not None:
+            tau1_metrics = compute_threshold_metrics(risk, shortage_no_ess, shortage_with_ess, risk_params.tau1)
+            tau2_metrics = compute_threshold_metrics(risk, shortage_no_ess, shortage_with_ess, risk_params.tau2)
+
+        return SimulationResult(
+            strategy, soc, ess_power, risk, shortage_no_ess, shortage_with_ess,
+            lole_no_ess, lole_with_ess, eens_no_ess, eens_with_ess,
+            total_profit, total_degradation_cost, total_charged, total_discharged,
+            tau1_metrics, tau2_metrics
+        )
+
+    # Strategy Helpers
+    def _max_discharge_power(self, soc: float) -> float:
+        ess = self.config.ess
+        max_energy = max(0.0, (soc - ess.soc_min_tech) * ess.energy_capacity_mwh)
+        return float(min(ess.power_discharge_mw, max_energy * ess.efficiency_discharge / self.config.time.dt_hours))
+
+    def _max_charge_power_to_full(self, soc: float) -> float:
+        ess = self.config.ess
+        max_energy = max(0.0, (ess.soc_max - soc) * ess.energy_capacity_mwh)
+        return float(min(ess.power_charge_mw, max_energy / (ess.efficiency_charge * self.config.time.dt_hours)))
+
+    def _decide_tou_power(self, soc_t, price_t, floor_soc, thresholds):
+        if price_t <= thresholds.price_low:
+            return -self._max_charge_power_to_full(soc_t)
+        if price_t >= thresholds.price_high and soc_t > floor_soc + 1e-6:
+            return self._max_discharge_power(soc_t)
+        return 0.0
+
+    def _decide_renewable_power(self, soc_t, ren_t, floor_soc, thresholds):
+        if ren_t >= thresholds.renewable_high:
+            return -self._max_charge_power_to_full(soc_t)
+        if ren_t <= thresholds.renewable_low and soc_t > floor_soc + 1e-6:
+            return self._max_discharge_power(soc_t)
+        return 0.0
+
+    def _decide_risk_based_power(
+        self,
+        t: int,
+        soc_t: float,
+        price_t: float,
+        risk_t: float,
+        risk_series: np.ndarray,
+        params: RiskBasedPolicyParams,
+        thresholds: MarketThresholds,
+    ) -> float:
+        """
+        [Real MPC Implementation]
+        Receding-horizon convex optimization over H steps.
+        Low-risk 구간(Horizon 내 위험 이벤트 없음)은 TOU 휴리스틱으로 처리,
+        위험 이벤트가 Horizon 내에 존재하면 CVXPY로 MPC 문제를 풀어서 결정.
+        """
+        cfg = self.config
+        ess = cfg.ess
+        H = cfg.time.look_ahead_hours
+        dt = cfg.time.dt_hours
+
+        # 1. Horizon 내 데이터 슬라이싱 + 패딩
+        end_idx = min(len(risk_series), t + H)
+        len_slice = end_idx - t
+
+        full_price = np.asarray(self.scenario.price_mwh, dtype=float)
+        price_horizon = full_price[t:end_idx]
+        risk_horizon = np.asarray(risk_series[t:end_idx], dtype=float)
+
+        if len_slice < H:
+            pad_len = H - len_slice
+            price_horizon = np.pad(price_horizon, (0, pad_len), "edge")
+            risk_horizon = np.pad(risk_horizon, (0, pad_len), "edge")
+
+        # 2. Risk Parameters에 따른 데드라인 및 목표 SOC 탐색
+        tau1, tau2 = params.tau1, params.tau2
+        s1, s2 = params.s1, params.s2
+
+        deadline_idx = -1
+        target_soc = ess.soc_min_tech
+
+        for k in range(H):
+            r_val = risk_horizon[k]
+            if r_val >= tau2:
+                deadline_idx = k
+                target_soc = max(s2, ess.soc_min_tech)
+                break  # High risk 우선
+            elif r_val >= tau1 and deadline_idx == -1:
+                deadline_idx = k
+                target_soc = max(s1, ess.soc_min_tech)
+
+        # Horizon 내에 어떤 위험 이벤트도 없으면, 단순 TOU 운전
+        if deadline_idx == -1:
+            return self._decide_tou_power(soc_t, price_t, ess.soc_min_tech, thresholds)
+
+        # 3. CVXPY 최적화 문제 정의
+        pc = cp.Variable(H, nonneg=True)
+        pd = cp.Variable(H, nonneg=True)
+        soc_var = cp.Variable(H + 1)
+
+        constraints = []
+        constraints.append(soc_var[0] == soc_t)
+
+        for k in range(H):
+            constraints.append(
+                soc_var[k + 1]
+                == soc_var[k]
+                + (pc[k] * ess.efficiency_charge - pd[k] / ess.efficiency_discharge)
+                * dt
+                / ess.energy_capacity_mwh
+            )
+            constraints.append(soc_var[k + 1] >= ess.soc_min_tech)
+            constraints.append(soc_var[k + 1] <= ess.soc_max)
+            constraints.append(pc[k] <= ess.power_charge_mw)
+            constraints.append(pd[k] <= ess.power_discharge_mw)
+
+        # Risk Constraint: 데드라인 이후에는 target_soc 이상 유지
+        for k in range(deadline_idx, H):
+            constraints.append(soc_var[k + 1] >= target_soc)
+
+        # 4. 목적함수: Arbitrage 수익 - 열화비용
+        deg_cost = ess.degradation_cost_per_mwh
+        revenue = cp.sum(cp.multiply(price_horizon, pd)) * dt
+        cost = cp.sum(cp.multiply(price_horizon, pc)) * dt
+        degradation = cp.sum(pd + pc) * dt * deg_cost
+
+        objective = cp.Maximize(revenue - cost - degradation)
+        prob = cp.Problem(objective, constraints)
+
+        # 5. Solver 실행 (ECOS → OSQP Fallback)
+        try:
+            prob.solve(solver=cp.ECOS)
+        except Exception:
+            try:
+                prob.solve(solver=cp.OSQP)
+            except Exception:
+                return 0.0
+
+        if prob.status not in ["optimal", "optimal_inaccurate"]:
+            return 0.0
+
+        p_charge_cmd = float(pc.value[0])
+        p_discharge_cmd = float(pd.value[0])
+
+        if abs(p_charge_cmd) < 1e-4:
+            p_charge_cmd = 0.0
+        if abs(p_discharge_cmd) < 1e-4:
+            p_discharge_cmd = 0.0
+
+        return float(p_discharge_cmd - p_charge_cmd)
+
+
+# ============================================================
+# 6. Optimization & Main Execution
+# ============================================================
+
+def make_offline_objective(config: SimulationConfig, mc_scenarios: int) -> Callable[[List[float]], float]:
+    def objective(x):
+        tau1, tau2, s1, s2 = x
+        if tau1 >= tau2 or s1 >= s2:
+            return 1e6 + (tau1 - tau2) ** 2 + (s1 - s2) ** 2
+
+        # Bounds check penalty
+        if not (config.tau1_bounds[0] <= tau1 <= config.tau1_bounds[1]):
+            return 1e6
+        if not (config.tau2_bounds[0] <= tau2 <= config.tau2_bounds[1]):
+            return 1e6
+        if not (config.s1_bounds[0] <= s1 <= config.s1_bounds[1]):
+            return 1e6
+        if not (config.s2_bounds[0] <= s2 <= config.s2_bounds[1]):
+            return 1e6
+
+        params = RiskBasedPolicyParams(tau1, tau2, s1, s2)
+        rng = np.random.default_rng(config.random_seed)
+
+        avg_lole = 0.0
+        avg_profit = 0.0
+        for _ in range(mc_scenarios):
+            scen = generate_synthetic_scenario(config, rng)
+            res = SimulationRunner(config, scen).simulate(Strategy.RISK_BASED, params)
+            avg_lole += res.lole_hours_with_ess
+            avg_profit += res.profit
+        avg_lole /= mc_scenarios
+        avg_profit /= mc_scenarios
+
+        w = config.optimization_weights
+        return w.lole_weight * avg_lole - w.profit_weight * avg_profit
+
+    return objective
+
+
+def offline_optimize_risk_params(config: SimulationConfig):
+    space = [
+        Real(config.tau1_bounds[0], config.tau1_bounds[1]),
+        Real(config.tau2_bounds[0], config.tau2_bounds[1]),
+        Real(config.s1_bounds[0], config.s1_bounds[1]),
+        Real(config.s2_bounds[0], config.s2_bounds[1])
+    ]
+    res = gp_minimize(
+        make_offline_objective(config, config.offline_mc_scenarios),
+        space,
+        n_calls=config.offline_n_calls,
+        random_state=config.random_seed,
+    )
+    return RiskBasedPolicyParams(*res.x), {
+        "best_objective": res.fun,
+        "tau1": res.x[0],
+        "tau2": res.x[1],
+        "s1": res.x[2],
+        "s2": res.x[3],
+    }
+
+
+if __name__ == "__main__":
+    sim_config = SimulationConfig()
+    print(f"Start Simulation with Capacity: {sim_config.reliability.firm_capacity_mw} MW")
+
+    # 1. Optimize
+    print("Running Optimization...")
+    opt_params, meta = offline_optimize_risk_params(sim_config)
+    print("Optimization Completed.")
+
+    # 2. Benchmark
+    rng_main = np.random.default_rng(sim_config.random_seed + 1)
+    test_scenario = generate_synthetic_scenario(sim_config, rng_main)
+
+    runner = SimulationRunner(sim_config, test_scenario)
+    res_no = runner.simulate(Strategy.NO_ESS)
+    res_tou = runner.simulate(Strategy.TOU)
+    res_ren = runner.simulate(Strategy.RENEWABLE)
+    res_risk = runner.simulate(Strategy.RISK_BASED, opt_params)
+
+    # 3. Report
+    print("\n" + "=" * 60)
+    print("FINAL RESULTS SUMMARY")
+    print("=" * 60)
+    print(
+        f"[1] Optimized Params: Tau1={meta['tau1']:.2f}, Tau2={meta['tau2']:.2f}, S1={meta['s1']:.2f}, S2={meta['s2']:.2f}"
+    )
+
+    print(f"\n[2] Benchmark Comparison")
+    print(f"{'Strategy':<12} | {'LOLE (h)':<10} | {'EENS (MWh)':<10} | {'Profit ($)':<12}")
+    print("-" * 55)
+    print(
+        f"{'NO_ESS':<12} | {res_no.lole_hours_without_ess:<10.2f} | {res_no.eens_mwh_without_ess:<10.2f} | {res_no.profit:<12.2f}"
+    )
+    print(
+        f"{'TOU':<12} | {res_tou.lole_hours_with_ess:<10.2f} | {res_tou.eens_mwh_with_ess:<10.2f} | {res_tou.profit:<12.2f}"
+    )
+    print(
+        f"{'RENEWABLE':<12} | {res_ren.lole_hours_with_ess:<10.2f} | {res_ren.eens_mwh_with_ess:<10.2f} | {res_ren.profit:<12.2f}"
+    )
+    print(
+        f"{'RISK_BASED':<12} | {res_risk.lole_hours_with_ess:<10.2f} | {res_risk.eens_mwh_with_ess:<10.2f} | {res_risk.profit:<12.2f}"
+    )
+
+    if res_risk.tau2_metrics:
+        m = res_risk.tau2_metrics
+        print(f"\n[3] Diagnostics (Tau2)")
+        print(f"AUC: {m.auc:.3f}, Resolved: {m.emergency_resolve_rate:.2%}, Recall: {m.recall:.2f}")
